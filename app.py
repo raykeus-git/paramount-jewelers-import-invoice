@@ -33,9 +33,6 @@ class InvoiceImporter:
                 best_score = score
                 best_match = col
 
-        if best_match:
-            st.write(f"✓ Matched {column_type}: '{best_match}' (score: {best_score})")
-
         return best_match
 
     def smart_column_detection(self, df):
@@ -55,7 +52,6 @@ class InvoiceImporter:
         desc_col = self.find_best_column_match(df.columns, desc_keywords, "Description")
 
         if not style_col and not qty_col and not cost_col:
-            st.write("⚙️ No columns detected by keywords, attempting pattern analysis...")
             for col in df.columns:
                 sample_values = df[col].dropna().head(10)
 
@@ -66,22 +62,17 @@ class InvoiceImporter:
 
                 if not style_col and has_alphanumeric and len(sample_values) > 0:
                     style_col = col
-                    st.write(f"✓ Pattern matched style column: {col}")
                 elif not qty_col and has_numeric and not style_col == col:
                     if all(float(str(v).replace(',', '')) < 10000 for v in sample_values if str(v).strip()):
                         qty_col = col
-                        st.write(f"✓ Pattern matched quantity column: {col}")
                 elif not cost_col and has_numeric and col != qty_col:
                     cost_col = col
-                    st.write(f"✓ Pattern matched cost column: {col}")
 
         return style_col, qty_col, cost_col, desc_col
 
     def read_excel(self, file):
         try:
             df_raw = pd.read_excel(file, header=None)
-
-            st.write(f"📊 Initial read - {len(df_raw)} rows and {len(df_raw.columns)} columns")
 
             header_row = None
             for idx in range(min(15, len(df_raw))):
@@ -93,29 +84,14 @@ class InvoiceImporter:
 
                 if non_numeric_count >= 2:
                     header_row = idx
-                    st.write(f"✓ Found header row at index {idx}")
                     break
 
             if header_row is not None:
                 df = pd.read_excel(file, header=header_row)
             else:
                 df = pd.read_excel(file)
-                st.write("⚙️ Using default header row")
-
-            st.write(f"📋 Found {len(df)} rows and {len(df.columns)} columns")
-            with st.expander("View detected column names"):
-                st.write(list(df.columns))
 
             style_col, qty_col, cost_col, desc_col = self.smart_column_detection(df)
-
-            if not style_col:
-                st.warning("⚠️ Could not auto-detect style column")
-            if not qty_col:
-                st.warning("⚠️ Could not auto-detect quantity column")
-            if not cost_col:
-                st.warning("⚠️ Could not auto-detect cost column")
-            if not desc_col:
-                st.info("ℹ️ Could not auto-detect description column")
 
             data = []
             for idx, row in df.iterrows():
@@ -123,6 +99,13 @@ class InvoiceImporter:
                 quantity = str(row[qty_col]).strip() if qty_col and pd.notna(row[qty_col]) else ""
                 cost = str(row[cost_col]).strip() if cost_col and pd.notna(row[cost_col]) else ""
                 description = str(row[desc_col]).strip() if desc_col and pd.notna(row[desc_col]) else ""
+
+                # Round cost to 2 decimal places
+                if cost and cost.lower() not in ['nan', 'none', '']:
+                    try:
+                        cost = f"{float(cost):.2f}"
+                    except:
+                        pass
 
                 if not description or description.lower() in ['nan', 'none']:
                     description = 'New SKU, please add description.'
@@ -135,26 +118,27 @@ class InvoiceImporter:
                         'Description': description
                     })
 
-            st.success(f"✅ Total rows extracted: {len(data)}")
             return data
         except Exception as e:
             raise Exception(f"Error reading Excel file: {str(e)}")
 
     def smart_column_detection_pdf(self, headers):
         """Intelligently detect columns for PDF tables"""
-        style_keywords = ['style', 'sku', 'item', 'product', 'prod', 'part', 'number',
+        style_keywords = ['style', 'sku', 'item', 'product', 'prod', 'part', 'number', 'no',
                          'code', 'article', 'model', 'ref', 'reference', 'material']
-        qty_keywords = ['qty', 'quantity', 'amount', 'count', 'units', 'ord', 'ordered',
-                       'pieces', 'pcs', 'pack', 'carton']
-        cost_keywords = ['cost', 'price', 'rate', 'total', 'value', 'amount', 'unit',
-                        'unitprice', 'each', 'perpcs', 'charge']
+        qty_keywords = ['qty', 'quantity', 'amount', 'count', 'units', 'ordered',
+                       'pieces', 'pcs', 'pack', 'carton', 'shipped']
+        cost_keywords = ['cost', 'price', 'rate', 'unit', 'unitprice', 'each', 'perpcs', 'charge']
+        desc_keywords = ['desc', 'description', 'name', 'detail', 'title', 'specification', 'watch']
 
         style_idx = -1
         qty_idx = -1
         cost_idx = -1
+        desc_idx = -1
         best_style_score = 0
         best_qty_score = 0
         best_cost_score = 0
+        best_desc_score = 0
 
         for idx, header in enumerate(headers):
             header_lower = str(header).lower()
@@ -174,7 +158,16 @@ class InvoiceImporter:
                 best_cost_score = cost_score
                 cost_idx = idx
 
-        return style_idx, qty_idx, cost_idx
+            desc_score = sum(10 if kw in header_lower else 0 for kw in desc_keywords)
+            if desc_score > best_desc_score:
+                best_desc_score = desc_score
+                desc_idx = idx
+
+        # Fallback: if we have a 4-column table and desc wasn't detected, assume last column is description
+        if desc_idx < 0 and len(headers) == 4:
+            desc_idx = 3
+
+        return style_idx, qty_idx, cost_idx, desc_idx
 
     def extract_text_based_data(self, page):
         """Extract data from PDF text when tables aren't detected"""
@@ -183,7 +176,6 @@ class InvoiceImporter:
             return []
 
         lines = text.split('\n')
-        st.write(f"📄 Extracted {len(lines)} lines of text from PDF")
 
         data_rows = []
         for line in lines:
@@ -208,20 +200,19 @@ class InvoiceImporter:
             data = []
 
             with pdfplumber.open(file) as pdf:
-                st.write(f"📄 PDF has {len(pdf.pages)} pages")
-
-                for page_num, page in enumerate(pdf.pages):
-                    st.write(f"⚙️ Processing page {page_num + 1}")
+                for page in pdf.pages:
                     tables = page.extract_tables()
 
                     if tables:
-                        st.write(f"✓ Found {len(tables)} tables on page {page_num + 1}")
-
-                        for table_num, table in enumerate(tables):
+                        for table in tables:
                             if not table or len(table) < 2:
                                 continue
 
-                            style_idx, qty_idx, cost_idx = self.smart_column_detection_pdf(table[0])
+                            style_idx, qty_idx, cost_idx, desc_idx = self.smart_column_detection_pdf(table[0])
+
+                            # Skip tables that don't have at least style column AND (quantity or cost) detected
+                            if style_idx < 0 or (qty_idx < 0 and cost_idx < 0):
+                                continue
 
                             for row in table[1:]:
                                 if not row or all(not cell for cell in row):
@@ -230,20 +221,108 @@ class InvoiceImporter:
                                 vendor_style = str(row[style_idx]).strip() if style_idx >= 0 and style_idx < len(row) and row[style_idx] else ""
                                 quantity = str(row[qty_idx]).strip() if qty_idx >= 0 and qty_idx < len(row) and row[qty_idx] else ""
                                 cost = str(row[cost_idx]).strip() if cost_idx >= 0 and cost_idx < len(row) and row[cost_idx] else ""
+                                description = str(row[desc_idx]).strip() if desc_idx >= 0 and desc_idx < len(row) and row[desc_idx] else ""
 
-                                if vendor_style and vendor_style.lower() not in ['nan', 'none', 'style', 'sku', 'item', 'product']:
-                                    data.append({
-                                        'Vendor Style #': vendor_style,
-                                        'Quantity': quantity if quantity and quantity.lower() != 'nan' else '',
-                                        'Cost': cost if cost and cost.lower() != 'nan' else '',
-                                        'Description': 'New SKU, please add description.'
-                                    })
+                                # Clean up vendor style - remove newlines and special chars
+                                if vendor_style:
+                                    vendor_style = ' '.join(vendor_style.split())
+                                    # Remove non-alphanumeric chars except hyphens and slashes
+                                    vendor_style = re.sub(r'[^\w\-/]', '', vendor_style)
+
+                                # Clean up quantity - extract just the number
+                                if quantity:
+                                    quantity = re.sub(r'[^\d.]', '', quantity)
+
+                                # Clean up cost - extract just the number
+                                if cost:
+                                    # Remove all non-numeric chars except decimal point
+                                    cost = re.sub(r'[^\d.]', '', cost)
+                                    # If multiple decimals or other issues, try to get first valid number
+                                    cost_match = re.search(r'\d+\.?\d*', cost)
+                                    if cost_match:
+                                        cost = cost_match.group()
+                                    # Round to 2 decimal places
+                                    try:
+                                        cost = f"{float(cost):.2f}"
+                                    except:
+                                        pass
+
+                                # Clean up description - remove newlines and extra spaces
+                                if description:
+                                    description = ' '.join(description.split())
+
+                                if not description or description.lower() in ['nan', 'none']:
+                                    description = 'New SKU, please add description.'
+
+                                # BRAND NAME SWAP: If vendor style is a brand name, swap with product code from description
+                                brand_names = ['citizen', 'bulova', 'seiko', 'casio', 'timex']
+
+                                # Check if vendor_style is a brand name
+                                if vendor_style and vendor_style.lower() in brand_names:
+                                    # If description exists and contains a product code, extract it
+                                    if description and description != 'New SKU, please add description.':
+                                        desc_words = description.split()
+                                        if desc_words:
+                                            # Check if first word looks like a product code (letters + numbers)
+                                            first_word = desc_words[0]
+                                            if re.search(r'[A-Za-z]', first_word) and re.search(r'\d', first_word):
+                                                # Perform the swap
+                                                vendor_style = first_word
+                                                description = ' '.join(desc_words[1:]) if len(desc_words) > 1 else 'New SKU, please add description.'
+                                            else:
+                                                # No valid product code in description, skip this row (it's probably a subtotal)
+                                                continue
+                                        else:
+                                            # Description is empty after splitting, skip
+                                            continue
+                                    else:
+                                        # Brand name but no description, skip this row
+                                        continue
+
+                                # Skip empty or invalid vendor styles
+                                if not vendor_style or len(vendor_style) < 2:
+                                    continue
+
+                                # Skip vendor styles that are all numeric (likely IDs, not product codes)
+                                if vendor_style.replace('-', '').replace('/', '').isdigit():
+                                    continue
+
+                                vendor_style_lower = vendor_style.lower()
+
+                                # Skip header-like values
+                                if vendor_style_lower in ['nan', 'none', 'style', 'sku', 'item', 'product', 'model', 'no', 'modelno']:
+                                    continue
+
+                                # Final safety check: skip if vendor style is STILL a brand name (shouldn't happen after swap)
+                                if vendor_style_lower in brand_names:
+                                    continue
+
+                                # Skip rows with keywords that indicate non-product lines
+                                skip_keywords = ['insurance', 'charge', 'shipping', 'freight', 'tax', 'subtotal', 'total',
+                                               'sales', 'sale', 'discount', 'remit', 'balance', 'payment', 'invoice',
+                                               'pursuant', 'article', 'chapter', 'division', 'summary']
+                                if any(keyword in vendor_style_lower for keyword in skip_keywords):
+                                    continue
+
+                                # Skip if cost is invalid (0.00 or empty after cleaning)
+                                if cost and (float(cost) if cost.replace('.', '').isdigit() else -1) == 0.0:
+                                    continue
+
+                                # Ensure description is never empty
+                                if not description or description.strip() == '':
+                                    description = 'New SKU, please add description.'
+
+                                # Append the data
+                                data.append({
+                                    'Vendor Style #': vendor_style,
+                                    'Quantity': quantity if quantity else '',
+                                    'Cost': cost if cost else '',
+                                    'Description': description
+                                })
                     else:
-                        st.write("⚙️ No tables found, trying text extraction...")
                         text_rows = self.extract_text_based_data(page)
 
                         if text_rows:
-                            st.write(f"✓ Found {len(text_rows)} potential data rows in text")
 
                             for row_parts in text_rows:
                                 vendor_style = ""
@@ -259,9 +338,18 @@ class InvoiceImporter:
                                 for i, part in enumerate(row_parts):
                                     part = str(part).strip()
 
-                                    if re.match(r'^[A-Z]{2}[0-9]{4}', part):
-                                        vendor_style = part
-                                        style_idx = i
+                                    # More flexible pattern for vendor style codes
+                                    # Matches: AB1234, AB1234-56X, AB-1234, 1234AB, ABC, etc.
+                                    # Must have at least one letter and one number, OR be 3+ alphanumeric chars
+                                    has_letter = bool(re.search(r'[A-Z]', part.upper()))
+                                    has_number = bool(re.search(r'\d', part))
+                                    is_alphanumeric = re.match(r'^[A-Z0-9\-/]+$', part.upper())
+
+                                    if is_alphanumeric and len(part) >= 3:
+                                        if (has_letter and has_number) or (has_letter and len(part) >= 4):
+                                            if not vendor_style:  # Only take the first match
+                                                vendor_style = part
+                                                style_idx = i
                                     elif part.upper() == 'EA':
                                         ea_idx = i
                                     elif re.match(r'^\$?\d+\.?\d*$', part.replace(',', '')):
@@ -271,9 +359,29 @@ class InvoiceImporter:
                                             qty_fields.append(part)
 
                                 if vendor_style and price_fields:
+                                    # Skip summary rows (subtotal, total, grand total, etc.)
+                                    vendor_style_lower = vendor_style.lower()
+                                    skip_keywords = ['insurance', 'charge', 'shipping', 'freight', 'tax', 'subtotal', 'total',
+                                                    'sales', 'sale', 'discount', 'remit', 'balance', 'payment', 'invoice',
+                                                    'pursuant', 'article', 'chapter', 'division', 'summary', 'grand', 'amount']
+
+                                    if any(keyword in vendor_style_lower for keyword in skip_keywords):
+                                        continue
+
+                                    # Skip if cost is 0.00
+                                    cost_value = price_fields[-2] if len(price_fields) >= 2 else price_fields[-1]
+                                    if cost_value and (float(cost_value) if cost_value.replace('.', '').isdigit() else -1) == 0.0:
+                                        continue
+
                                     if qty_fields:
                                         quantity = qty_fields[0]
                                     cost = price_fields[-2] if len(price_fields) >= 2 else price_fields[-1]
+
+                                    # Round cost to 2 decimal places
+                                    try:
+                                        cost = f"{float(cost):.2f}"
+                                    except:
+                                        pass
 
                                     if style_idx >= 0 and ea_idx >= 0:
                                         desc_parts = row_parts[style_idx + 1:ea_idx]
@@ -289,6 +397,39 @@ class InvoiceImporter:
                                     if not description:
                                         description = 'New SKU, please add description.'
 
+                                    # BRAND NAME SWAP: If vendor style is a brand name, swap with product code from description
+                                    brand_names = ['citizen', 'bulova', 'seiko', 'casio', 'timex']
+
+                                    # Check if vendor_style is a brand name
+                                    if vendor_style and vendor_style.lower() in brand_names:
+                                        # If description exists and contains a product code, extract it
+                                        if description and description != 'New SKU, please add description.':
+                                            desc_words = description.split()
+                                            if desc_words:
+                                                # Check if first word looks like a product code (letters + numbers)
+                                                first_word = desc_words[0]
+                                                if re.search(r'[A-Za-z]', first_word) and re.search(r'\d', first_word):
+                                                    # Perform the swap
+                                                    vendor_style = first_word
+                                                    description = ' '.join(desc_words[1:]) if len(desc_words) > 1 else 'New SKU, please add description.'
+                                                else:
+                                                    # No valid product code in description, skip this row (it's probably a subtotal)
+                                                    continue
+                                            else:
+                                                # Description is empty after splitting, skip
+                                                continue
+                                        else:
+                                            # Brand name but no description, skip this row
+                                            continue
+
+                                    # Final safety check: skip if vendor style is STILL a brand name
+                                    if vendor_style.lower() in brand_names:
+                                        continue
+
+                                    # Ensure description is never empty
+                                    if not description or description.strip() == '':
+                                        description = 'New SKU, please add description.'
+
                                     data.append({
                                         'Vendor Style #': vendor_style,
                                         'Quantity': quantity,
@@ -296,7 +437,6 @@ class InvoiceImporter:
                                         'Description': description
                                     })
 
-            st.success(f"✅ Total rows extracted from PDF: {len(data)}")
             return data
         except Exception as e:
             raise Exception(f"Error reading PDF file: {str(e)}")
@@ -312,7 +452,7 @@ def main():
     st.title("📄 Invoice Import Tool")
     st.markdown("""
     Upload an Excel or PDF invoice file to extract vendor style, quantity, cost, and description data.
-    The application will automatically detect the correct columns and export to Excel format.
+    The application will automatically detect the correct columns and export to Excel format!
     """)
 
     st.divider()
@@ -329,17 +469,16 @@ def main():
         file_ext = os.path.splitext(uploaded_file.name)[1].lower()
 
         if st.button("🚀 Process File", type="primary"):
+            # Clear any caching
+            st.cache_data.clear()
+
             importer = InvoiceImporter()
 
             with st.spinner("Processing file..."):
                 try:
-                    st.subheader("📊 Processing Details")
-
                     if file_ext in ['.xlsx', '.xls']:
-                        st.info("📊 Detected Excel file")
                         data = importer.read_excel(uploaded_file)
                     elif file_ext == '.pdf':
-                        st.info("📄 Detected PDF file")
                         data = importer.read_pdf(uploaded_file)
                     else:
                         st.error("❌ Unsupported file format")
@@ -347,6 +486,69 @@ def main():
 
                     if not data:
                         st.warning("⚠️ No data could be extracted from the file.")
+
+                        # DEBUG: Show what happened during extraction
+                        st.write("DEBUG: Re-processing to show details...")
+                        if file_ext == '.pdf':
+                            uploaded_file.seek(0)
+                            with pdfplumber.open(uploaded_file) as pdf:
+                                for page_num, page in enumerate(pdf.pages[:1]):
+                                    tables = page.extract_tables()
+                                    for table_num, table in enumerate(tables):
+                                        if table and len(table) >= 2:
+                                            st.write(f"**Table {table_num + 1} Headers:** {table[0]}")
+                                            style_idx, qty_idx, cost_idx, desc_idx = importer.smart_column_detection_pdf(table[0])
+                                            st.write(f"- Style column index: {style_idx} = {table[0][style_idx] if style_idx >= 0 else 'NOT FOUND'}")
+                                            st.write(f"- Qty column index: {qty_idx} = {table[0][qty_idx] if qty_idx >= 0 else 'NOT FOUND'}")
+                                            st.write(f"- Cost column index: {cost_idx} = {table[0][cost_idx] if cost_idx >= 0 else 'NOT FOUND'}")
+                                            st.write(f"- Desc column index: {desc_idx} = {table[0][desc_idx] if desc_idx >= 0 else 'NOT FOUND'}")
+                                            if style_idx >= 0:
+                                                for row_num, row in enumerate(table[1:3]):
+                                                    if row:
+                                                        vendor_style_raw = row[style_idx] if style_idx < len(row) else "OUT OF BOUNDS"
+                                                        st.write(f"- Row {row_num + 1} vendor style (raw): '{vendor_style_raw}'")
+
+                        # Show diagnostic information for troubleshooting
+                        if file_ext == '.pdf':
+                            with st.expander("🔍 Show full diagnostic information"):
+                                try:
+                                    with pdfplumber.open(uploaded_file) as pdf:
+                                        st.write(f"**PDF Pages:** {len(pdf.pages)}")
+
+                                        for page_num, page in enumerate(pdf.pages[:2]):  # Check first 2 pages
+                                            st.write(f"\n**Page {page_num + 1}:**")
+
+                                            tables = page.extract_tables()
+                                            st.write(f"- Tables found: {len(tables)}")
+
+                                            # Show table contents
+                                            if tables:
+                                                for table_num, table in enumerate(tables[:3]):  # First 3 tables
+                                                    st.write(f"\n**Table {table_num + 1}:**")
+                                                    if table and len(table) > 0:
+                                                        st.write(f"  - Rows: {len(table)}, Columns: {len(table[0]) if table[0] else 0}")
+                                                        st.write(f"  - Headers: {table[0]}")
+                                                        # Show first 3 data rows
+                                                        for row_num, row in enumerate(table[1:4]):
+                                                            st.write(f"  - Row {row_num + 1}: {row}")
+
+                                            text = page.extract_text()
+                                            if text:
+                                                lines = text.split('\n')[:20]  # First 20 lines
+                                                st.write(f"\n- Text lines: {len(text.split(chr(10)))}")
+                                                st.write("- Sample lines:")
+                                                for i, line in enumerate(lines):
+                                                    if line.strip():
+                                                        st.code(f"{i}: {line[:100]}")
+                                except Exception as e:
+                                    st.error(f"Could not read diagnostic info: {str(e)}")
+
+                        st.info("**Possible reasons:**\n"
+                               "- The file doesn't contain recognizable table structures\n"
+                               "- Column headers don't match expected patterns (style, sku, qty, quantity, cost, price, etc.)\n"
+                               "- For PDFs: The file may be image-based (scanned) rather than text-based\n"
+                               "- Vendor style codes don't have letters and numbers, or are too short (< 3 characters)\n"
+                               "- No price information found on the same line as vendor styles")
                         return
 
                     st.divider()
@@ -355,7 +557,33 @@ def main():
                     output_df = pd.DataFrame(data)
                     st.dataframe(output_df, use_container_width=True)
 
-                    st.metric("Total Rows", len(data))
+                    # Calculate totals
+                    total_quantity = 0
+                    total_cost = 0.0
+
+                    for item in data:
+                        # Parse quantity
+                        qty_str = str(item.get('Quantity', '')).replace(',', '')
+                        qty = 0
+                        if qty_str and qty_str.replace('.', '').isdigit():
+                            qty = int(float(qty_str))
+                            total_quantity += qty
+
+                        # Parse cost (unit price)
+                        cost_str = str(item.get('Cost', '')).replace(',', '').replace('$', '')
+                        if cost_str and cost_str.replace('.', '').isdigit():
+                            unit_cost = float(cost_str)
+                            # Multiply unit cost by quantity for line total
+                            total_cost += unit_cost * qty
+
+                    # Display metrics in columns
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Rows", len(data))
+                    with col2:
+                        st.metric("Total Quantity", f"{total_quantity:,}")
+                    with col3:
+                        st.metric("Total Cost", f"${total_cost:,.2f}")
 
                     st.divider()
                     st.subheader("💾 Download Results")
