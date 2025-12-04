@@ -213,13 +213,27 @@ class InvoiceImporter:
                 if not description or description.lower() in ['nan', 'none']:
                     description = 'New SKU, please add description.'
 
+                # Skip rows with tariff, tax, and other non-product keywords
+                if vendor_style:
+                    vendor_style_lower = vendor_style.lower()
+                    skip_keywords = ['tariff', 'tax', 'duty', 'insurance', 'charge', 'shipping',
+                                   'freight', 'subtotal', 'total', 'sales', 'discount', 'payment']
+                    if any(keyword in vendor_style_lower for keyword in skip_keywords):
+                        continue
+
+                # Skip row if quantity or cost is missing
+                quantity_valid = quantity and quantity.lower() not in ['nan', 'none', '']
+                cost_valid = cost and cost.lower() not in ['nan', 'none', '']
+
                 if vendor_style and vendor_style.lower() not in ['nan', 'none', 'style', 'sku', 'item', 'product']:
-                    data.append({
-                        'Vendor Style #': vendor_style,
-                        'Quantity': quantity if quantity and quantity.lower() != 'nan' else '',
-                        'Cost': cost if cost and cost.lower() != 'nan' else '',
-                        'Description': description
-                    })
+                    # Only add row if both quantity AND cost are present
+                    if quantity_valid and cost_valid:
+                        data.append({
+                            'Vendor Style #': vendor_style,
+                            'Quantity': quantity,
+                            'Cost': cost,
+                            'Description': description
+                        })
 
             print(f"DEBUG: Total rows extracted: {len(data)}")
             return data
@@ -332,13 +346,19 @@ class InvoiceImporter:
                                 quantity = str(row[qty_idx]).strip() if qty_idx >= 0 and qty_idx < len(row) and row[qty_idx] else ""
                                 cost = str(row[cost_idx]).strip() if cost_idx >= 0 and cost_idx < len(row) and row[cost_idx] else ""
 
+                                # Skip row if quantity or cost is missing
+                                quantity_valid = quantity and quantity.lower() not in ['nan', 'none', '']
+                                cost_valid = cost and cost.lower() not in ['nan', 'none', '']
+
                                 if vendor_style and vendor_style.lower() not in ['nan', 'none', 'style', 'sku', 'item', 'product']:
-                                    data.append({
-                                        'Vendor Style #': vendor_style,
-                                        'Quantity': quantity if quantity and quantity.lower() != 'nan' else '',
-                                        'Cost': cost if cost and cost.lower() != 'nan' else '',
-                                        'Description': 'New SKU, please add description.'
-                                    })
+                                    # Only add row if both quantity AND cost are present
+                                    if quantity_valid and cost_valid:
+                                        data.append({
+                                            'Vendor Style #': vendor_style,
+                                            'Quantity': quantity,
+                                            'Cost': cost,
+                                            'Description': 'New SKU, please add description.'
+                                        })
                     else:
                         print("DEBUG: No tables found, trying text extraction...")
                         text_rows = self.extract_text_based_data(page)
@@ -376,6 +396,10 @@ class InvoiceImporter:
                                     if qty_fields:
                                         quantity = qty_fields[0]
                                     cost = price_fields[-2] if len(price_fields) >= 2 else price_fields[-1]
+
+                                    # Skip row if quantity or cost is missing
+                                    if not quantity or not cost:
+                                        continue
 
                                     if style_idx >= 0 and ea_idx >= 0:
                                         desc_parts = row_parts[style_idx + 1:ea_idx]
