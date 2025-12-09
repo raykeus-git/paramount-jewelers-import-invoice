@@ -78,6 +78,11 @@ class InvoiceImporter:
                 'skip_exact': [],
                 'description': 'Invicta vendor - no filters configured'
             },
+            'Zenith': {
+                'skip_patterns': [],     # No filters yet - add as needed
+                'skip_exact': [],
+                'description': 'Zenith vendor - no filters configured'
+            },
         }
 
     def should_skip_vendor_style(self, vendor_style):
@@ -233,6 +238,12 @@ class InvoiceImporter:
                     if any(keyword in vendor_style_lower for keyword in skip_keywords):
                         continue
 
+                # Zenith-specific: Filter out customer numbers from Excel
+                if self.vendor == 'Zenith' and vendor_style:
+                    # Check if it looks like a customer number: P followed by digits
+                    if re.match(r'^P\d+$', vendor_style, re.IGNORECASE):
+                        continue
+
                 # Skip row if quantity or cost is missing
                 quantity_valid = quantity and quantity.lower() not in ['nan', 'none', '']
                 cost_valid = cost and cost.lower() not in ['nan', 'none', '']
@@ -278,6 +289,10 @@ class InvoiceImporter:
         for idx, header in enumerate(headers):
             header_lower = str(header).lower()
             header_clean = header_lower.strip()
+
+            # For Zenith: Skip customer columns when detecting style column
+            if self.vendor == 'Zenith' and ('customer' in header_lower or 'cust' in header_lower):
+                continue  # Don't consider this column for style detection
 
             style_score = sum(10 if kw in header_lower else 0 for kw in style_keywords)
             if style_score > best_style_score:
@@ -395,6 +410,35 @@ class InvoiceImporter:
                         desc_idx = headers.index(desc_col)
                     except:
                         pass
+
+        elif self.vendor == 'Zenith':
+            # Zenith: Prefer "Unit Price" over "Amount USD" or other amount columns
+            if unit_price_idx >= 0:
+                cost_idx = unit_price_idx
+
+            # Zenith: Ensure we don't pick customer number columns as style columns
+            # If the style column contains "customer" in its name, find a different column
+            if style_idx >= 0 and style_idx < len(headers):
+                current_style_header = str(headers[style_idx]).lower()
+                if 'customer' in current_style_header or 'cust' in current_style_header:
+                    # Found customer column - need to find actual style column
+                    # Look for alternative columns that could be style
+                    alternative_style_idx = -1
+                    best_alt_score = 0
+
+                    for idx, header in enumerate(headers):
+                        if idx == style_idx:  # Skip the customer column
+                            continue
+                        header_lower = str(header).lower()
+                        # Look for style/sku/item/product keywords
+                        alt_score = sum(10 if kw in header_lower else 0 for kw in ['style', 'sku', 'item', 'product', 'model', 'reference'])
+                        if alt_score > best_alt_score:
+                            best_alt_score = alt_score
+                            alternative_style_idx = idx
+
+                    # If we found an alternative, use it
+                    if alternative_style_idx >= 0:
+                        style_idx = alternative_style_idx
 
         # Fallback: if we have a 4-column table and desc wasn't detected, assume last column is description
         if desc_idx < 0 and len(headers) == 4:
@@ -638,6 +682,72 @@ class InvoiceImporter:
                                         pass
                         continue  # Skip to next page, don't do table extraction
 
+                    # For Zenith, use text extraction if tables aren't detected properly
+                    if self.vendor == 'Zenith':
+                        text = page.extract_text()
+                        if text:
+                            lines = text.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                parts = line.split()
+
+                                # Product line format: Sr# OrderNum StyleSKU Description Qty Unit UnitPrice AmountUSD
+                                # Example: 1 100001562 JNB7356S-55FY70 RING # 1.00 PCS 484.24 484.24
+                                if len(parts) >= 7:
+                                    try:
+                                        # Check if first part is a serial number (digit)
+                                        if parts[0].isdigit():
+                                            sr_num = parts[0]
+                                            order_num = parts[1]
+                                            style_sku = parts[2]
+
+                                            # Skip if style looks like customer number
+                                            if re.match(r'^P\d+$', style_sku, re.IGNORECASE):
+                                                continue
+
+                                            # Last two should be unit_price and amount_usd
+                                            amount_usd = parts[-1].replace('$', '').replace(',', '')
+                                            unit_price = parts[-2].replace('$', '').replace(',', '')
+
+                                            # Find quantity and unit (PCS, PR, etc)
+                                            # Work backwards from prices to find quantity
+                                            qty = None
+                                            unit = None
+                                            desc_end_idx = len(parts) - 2  # Default: everything before unit_price
+
+                                            # parts[-3] should be unit (PCS, PR), parts[-4] should be quantity
+                                            if len(parts) >= 4:
+                                                potential_unit = parts[-3]
+                                                potential_qty = parts[-4]
+
+                                                # Check if potential_qty is a number (might have decimal)
+                                                try:
+                                                    float(potential_qty)
+                                                    qty = potential_qty
+                                                    unit = potential_unit
+                                                    desc_end_idx = len(parts) - 4
+                                                except:
+                                                    pass
+
+                                            # Description is between style_sku and quantity
+                                            desc_parts = parts[3:desc_end_idx]
+                                            description = ' '.join(desc_parts).strip() if desc_parts else 'New SKU, please add description.'
+
+                                            if style_sku and qty and unit_price:
+                                                try:
+                                                    float(unit_price)
+                                                    data.append({
+                                                        'Vendor Style #': style_sku,
+                                                        'Quantity': qty,
+                                                        'Cost': unit_price,  # Use unit_price, not amount_usd
+                                                        'Description': description
+                                                    })
+                                                except:
+                                                    pass
+                                    except:
+                                        pass
+                        continue  # Skip to next page, don't do table extraction
+
                     tables = page.extract_tables()
                     data_extracted_from_tables = False  # Track if we actually got data from tables
 
@@ -645,6 +755,12 @@ class InvoiceImporter:
                         for table in tables:
                             if not table or len(table) < 2:
                                 continue
+
+                            # Zenith-specific: Skip tables with mostly None headers (address tables)
+                            if self.vendor == 'Zenith':
+                                none_count = sum(1 for h in table[0] if h is None or str(h).lower() == 'none')
+                                if none_count > len(table[0]) * 0.5:  # More than 50% None headers
+                                    continue
 
                             style_idx, qty_idx, cost_idx, desc_idx = self.smart_column_detection_pdf(table[0])
 
@@ -873,6 +989,13 @@ class InvoiceImporter:
                                 if self.should_skip_vendor_style(vendor_style):
                                     # st.info(f"⏭️ Skipping vendor-filtered code ({self.vendor}): {vendor_style}")
                                     continue
+
+                                # Zenith-specific: Filter out customer numbers
+                                # Customer numbers typically follow pattern like P149, P001, etc.
+                                if self.vendor == 'Zenith':
+                                    # Check if it looks like a customer number: P followed by digits
+                                    if re.match(r'^P\d+$', vendor_style, re.IGNORECASE):
+                                        continue
 
                                 vendor_style_lower = vendor_style.lower()
 
@@ -1402,7 +1525,7 @@ def main():
     with col1:
         vendor = st.selectbox(
             "Select Vendor",
-            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD', 'Invicta'],
+            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD', 'Invicta', 'Zenith'],
             help="Select vendor to apply vendor-specific filters (e.g., skip secondary identifiers)"
         )
         if vendor == 'None':
@@ -1595,6 +1718,7 @@ def main():
         - **IDD**: Prefers "Price" column over "Amount" column
         - **Casio/Bulova/Seiko/Citizen**: Prefers "Unit Price" over "Total Price"
         - **Invicta**: Maps "Invoiced"→Quantity, "Item"→Style, "Amount"→Cost
+        - **Zenith**: Prefers "Unit Price" over "Amount USD", filters customer numbers (P### pattern)
         - **None**: No vendor-specific filters applied
 
         ### What gets extracted:
