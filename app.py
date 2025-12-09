@@ -73,6 +73,11 @@ class InvoiceImporter:
                 'skip_exact': [],
                 'description': 'IDD USA vendor - no filters configured'
             },
+            'Invicta': {
+                'skip_patterns': [],     # No filters yet - add as needed
+                'skip_exact': [],
+                'description': 'Invicta vendor - no filters configured'
+            },
         }
 
     def should_skip_vendor_style(self, vendor_style):
@@ -348,6 +353,49 @@ class InvoiceImporter:
             # else:
                 # st.warning(f"⚠️ {self.vendor} vendor: 'Unit Price' column not found. Using auto-detected cost column (index {cost_idx}). Verify this is correct!")
 
+        elif self.vendor == 'Invicta':
+            # Invicta: specific column mappings
+            # - "Invoiced" → Quantity
+            # - "Item" → Vendor Style
+            # - "Description" → Description
+            # - "Amount" → Cost
+
+            # Find Invoiced column for quantity
+            invoiced_col = self.find_best_column_match(headers, ['invoiced'], 'quantity')
+            if invoiced_col:
+                try:
+                    invoiced_idx = headers.index(invoiced_col)
+                    qty_idx = invoiced_idx
+                except:
+                    pass
+
+            # Find Item column for vendor style
+            item_col = self.find_best_column_match(headers, ['item'], 'style')
+            if item_col:
+                try:
+                    item_idx = headers.index(item_col)
+                    style_idx = item_idx
+                except:
+                    pass
+
+            # Find Amount column for cost
+            amount_col = self.find_best_column_match(headers, ['amount'], 'cost')
+            if amount_col:
+                try:
+                    amount_idx = headers.index(amount_col)
+                    cost_idx = amount_idx
+                except:
+                    pass
+
+            # Description should already be detected, but double-check
+            if desc_idx < 0:
+                desc_col = self.find_best_column_match(headers, ['description', 'desc'], 'description')
+                if desc_col:
+                    try:
+                        desc_idx = headers.index(desc_col)
+                    except:
+                        pass
+
         # Fallback: if we have a 4-column table and desc wasn't detected, assume last column is description
         if desc_idx < 0 and len(headers) == 4:
             desc_idx = 3
@@ -542,6 +590,54 @@ class InvoiceImporter:
 
             with pdfplumber.open(file) as pdf:
                 for page_num, page in enumerate(pdf.pages):
+                    # For Invicta, skip table extraction entirely and use text extraction
+                    if self.vendor == 'Invicta':
+                        text = page.extract_text()
+                        if text:
+                            lines = text.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                parts = line.split()
+                                if len(parts) >= 7:
+                                    try:
+                                        ordered = parts[0]
+                                        invoiced = parts[1]
+                                        item = parts[2]
+
+                                        # Check if first 3 parts look valid
+                                        item_looks_like_po = '-' in item and item.count('-') >= 2
+                                        item_is_valid = (len(item) <= 12 and
+                                                       not item_looks_like_po and
+                                                       (item.isalnum() or item.isdigit()))
+
+                                        if ordered.isdigit() and invoiced.isdigit() and item_is_valid:
+                                            amount = parts[-1].replace('$', '').replace(',', '')
+                                            rate = parts[-2].replace('$', '').replace(',', '')
+
+                                            # Parse description
+                                            desc_parts = []
+                                            if len(parts) > 4:
+                                                start_idx = 4
+                                                if len(parts) > 5 and parts[5] == item:
+                                                    start_idx = 6
+                                                desc_parts = parts[start_idx:-2]
+
+                                            description = ' '.join(desc_parts).strip() if desc_parts else 'New SKU, please add description.'
+
+                                            try:
+                                                float(amount)
+                                                data.append({
+                                                    'Vendor Style #': item,
+                                                    'Quantity': invoiced,
+                                                    'Cost': amount,
+                                                    'Description': description
+                                                })
+                                            except:
+                                                pass
+                                    except:
+                                        pass
+                        continue  # Skip to next page, don't do table extraction
+
                     tables = page.extract_tables()
                     data_extracted_from_tables = False  # Track if we actually got data from tables
 
@@ -664,9 +760,22 @@ class InvoiceImporter:
                                 cost = str(cost) if cost else ""
                                 description = str(description) if description else ""
 
-                                # Debug: For IDD vendor, show which column cost was extracted from
-                                # if self.vendor == 'IDD' and vendor_style and row_idx == 0:  # Only show for first data row
-                                #     st.info(f"🔍 IDD Debug - First row extraction:\n   - Row data: {row}\n   - Extracting cost from index {cost_idx} (header: '{table[0][cost_idx] if cost_idx < len(table[0]) else 'N/A'}')\n   - Cost value extracted: '{cost}'")
+                                # Debug: For Invicta vendor, show what's being extracted
+                                if self.vendor == 'Invicta' and vendor_style:
+                                    st.info(f"🔍 Invicta Debug - Row {row_idx} extraction:\n   - Full row data: {row}\n   - Style column index: {style_idx}\n   - Qty column index: {qty_idx}\n   - Cost column index: {cost_idx}\n   - Raw vendor style: '{vendor_style}'\n   - Raw quantity: '{quantity}'\n   - Raw cost: '{cost}'\n   - All headers: {table[0]}")
+
+                                # Seiko-specific fix: Check if model number is split across two columns
+                                # Seiko invoices sometimes have "Customer SKU Mo" and "del No" as separate columns
+                                if self.vendor == 'Seiko' and vendor_style:
+                                    # Check if the next column exists and contains part of the model number
+                                    next_col_idx = style_idx + 1
+                                    if next_col_idx < len(row) and row[next_col_idx]:
+                                        next_col_value = str(row[next_col_idx]).strip()
+                                        # Check if vendor_style is very short (likely incomplete) and next column has data
+                                        if len(vendor_style) <= 3 and next_col_value and len(next_col_value) <= 10:
+                                            # Likely split model number - concatenate them
+                                            vendor_style = vendor_style + next_col_value
+                                            # st.info(f"🔧 Seiko: Merged split model number - '{row[style_idx]}' + '{next_col_value}' = '{vendor_style}'")
 
                                 # Clean up vendor style - if cell contains multiple lines, take the FIRST one (top style number)
                                 if vendor_style:
@@ -769,7 +878,7 @@ class InvoiceImporter:
 
                                 # Skip header-like values (including column headers that look like data)
                                 header_keywords = ['nan', 'none', 'style', 'sku', 'item', 'product', 'model', 'no', 'modelno',
-                                                 'shipped', 'ordered', 'backordered', 'quantity', 'price', 'cost', 'description']
+                                                 'shipped', 'ordered', 'backordered', 'quantity', 'price', 'cost', 'description', 'ins', 'insurance']
                                 if vendor_style_lower in header_keywords:
                                     continue
 
@@ -1293,7 +1402,7 @@ def main():
     with col1:
         vendor = st.selectbox(
             "Select Vendor",
-            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD'],
+            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD', 'Invicta'],
             help="Select vendor to apply vendor-specific filters (e.g., skip secondary identifiers)"
         )
         if vendor == 'None':
@@ -1485,6 +1594,7 @@ def main():
         - **YGI**: Filters out Amazon ASINs (B0/X00 codes) and U-codes
         - **IDD**: Prefers "Price" column over "Amount" column
         - **Casio/Bulova/Seiko/Citizen**: Prefers "Unit Price" over "Total Price"
+        - **Invicta**: Maps "Invoiced"→Quantity, "Item"→Style, "Amount"→Cost
         - **None**: No vendor-specific filters applied
 
         ### What gets extracted:
