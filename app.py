@@ -83,6 +83,11 @@ class InvoiceImporter:
                 'skip_exact': [],
                 'description': 'Zenith vendor - no filters configured'
             },
+            'Jewelry Depo': {
+                'skip_patterns': [],     # No filters yet - add as needed
+                'skip_exact': [],
+                'description': 'Jewelry Depo vendor - no filters configured'
+            },
         }
 
     def should_skip_vendor_style(self, vendor_style):
@@ -880,6 +885,92 @@ class InvoiceImporter:
                                 if self.vendor == 'Invicta' and vendor_style:
                                     st.info(f"🔍 Invicta Debug - Row {row_idx} extraction:\n   - Full row data: {row}\n   - Style column index: {style_idx}\n   - Qty column index: {qty_idx}\n   - Cost column index: {cost_idx}\n   - Raw vendor style: '{vendor_style}'\n   - Raw quantity: '{quantity}'\n   - Raw cost: '{cost}'\n   - All headers: {table[0]}")
 
+                                # Jewelry Depo-specific: Handle multi-line cells by splitting into separate rows
+                                if self.vendor == 'Jewelry Depo' and vendor_style and '\n' in vendor_style:
+                                    # Split all fields by newlines
+                                    style_lines = [line.strip() for line in vendor_style.split('\n') if line.strip()]
+                                    qty_lines = [line.strip() for line in quantity.split('\n') if line.strip()]
+                                    cost_lines = [line.strip() for line in cost.split('\n') if line.strip()]
+                                    desc_lines_raw = [line.strip() for line in description.split('\n') if line.strip()]
+
+                                    # Filter out unwanted description lines (FROM TEXT, PO numbers)
+                                    desc_lines = []
+                                    for desc in desc_lines_raw:
+                                        # Skip "FROM TEXT" lines
+                                        if desc.upper() == 'FROM TEXT':
+                                            continue
+                                        # Skip PO number lines (e.g., "25-2708", "PO # 25-2695", "PO# 25-2708", etc.)
+                                        # Pattern 1: Just digits-digits
+                                        if re.match(r'^\d+-\d+$', desc):
+                                            continue
+                                        # Pattern 2: "PO #" or "PO#" followed by digits-digits
+                                        if re.match(r'^PO\s*#?\s*\d+-\d+$', desc, re.IGNORECASE):
+                                            continue
+                                        # Keep this description
+                                        desc_lines.append(desc)
+
+                                    # Process each line as a separate product
+                                    # Note: We'll skip the normal processing below and continue to next row
+                                    for i in range(len(style_lines)):
+                                        item_style = style_lines[i] if i < len(style_lines) else ""
+                                        item_qty = qty_lines[i] if i < len(qty_lines) else ""
+                                        item_cost = cost_lines[i] if i < len(cost_lines) else ""
+                                        item_desc = desc_lines[i] if i < len(desc_lines) else ""
+
+                                        # Clean up the individual values
+                                        item_style = ' '.join(item_style.split())
+                                        item_style = re.sub(r'[^\w\-/]', '', item_style)
+
+                                        # Jewelry Depo: Transform style number format
+                                        # From: 005-9mm9 → To: 005TR9M9
+                                        # From: 518-8mm11 → To: 518TR8M11
+                                        # Pattern: ItemNum-Sizemm[#]RingSize → ItemNumTRSizeMRingSize (# is optional)
+                                        style_match = re.match(r'^(\d+)-(\d+)mm#?([\d.]+)$', item_style, re.IGNORECASE)
+                                        if style_match:
+                                            item_num = style_match.group(1)  # e.g., "005" or "518"
+                                            size = style_match.group(2)       # e.g., "9" or "8"
+                                            ring_size = style_match.group(3)  # e.g., "9" or "11" or "8.5"
+                                            # Transform to: ItemNumTRSizeMRingSize
+                                            item_style = f"{item_num}TR{size}M{ring_size}"
+
+                                        # Clean quantity
+                                        if item_qty:
+                                            item_qty = re.sub(r'[^\d.]', '', item_qty)
+                                            try:
+                                                qty_float = float(item_qty)
+                                                if qty_float == int(qty_float):
+                                                    item_qty = str(int(qty_float))
+                                            except:
+                                                pass
+
+                                        # Clean cost
+                                        if item_cost:
+                                            item_cost = re.sub(r'[^\d.]', '', item_cost)
+                                            cost_match = re.search(r'\d+\.?\d*', item_cost)
+                                            if cost_match:
+                                                item_cost = cost_match.group()
+                                            try:
+                                                item_cost = f"{float(item_cost):.2f}"
+                                            except:
+                                                pass
+
+                                        # Set default description if empty
+                                        if not item_desc or item_desc.lower() in ['nan', 'none']:
+                                            item_desc = 'New SKU, please add description.'
+
+                                        # Validate and add the row
+                                        if item_style and item_qty and item_cost:
+                                            data.append({
+                                                'Vendor Style #': item_style,
+                                                'Quantity': item_qty,
+                                                'Cost': item_cost,
+                                                'Description': item_desc
+                                            })
+                                            data_extracted_from_tables = True
+
+                                    # Skip the normal processing below for this row
+                                    continue
+
                                 # Seiko-specific fix: Check if model number is split across two columns
                                 # Seiko invoices sometimes have "Customer SKU Mo" and "del No" as separate columns
                                 if self.vendor == 'Seiko' and vendor_style:
@@ -1525,7 +1616,7 @@ def main():
     with col1:
         vendor = st.selectbox(
             "Select Vendor",
-            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD', 'Invicta', 'Zenith'],
+            options=['None', 'YGI', 'DNG', 'Rolex', 'Seiko', 'Citizen', 'Bulova', 'Casio', 'IDD', 'Invicta', 'Zenith', 'Jewelry Depo'],
             help="Select vendor to apply vendor-specific filters (e.g., skip secondary identifiers)"
         )
         if vendor == 'None':
@@ -1719,6 +1810,7 @@ def main():
         - **Casio/Bulova/Seiko/Citizen**: Prefers "Unit Price" over "Total Price"
         - **Invicta**: Maps "Invoiced"→Quantity, "Item"→Style, "Amount"→Cost
         - **Zenith**: Prefers "Unit Price" over "Amount USD", filters customer numbers (P### pattern)
+        - **Jewelry Depo**: Standard column detection
         - **None**: No vendor-specific filters applied
 
         ### What gets extracted:
